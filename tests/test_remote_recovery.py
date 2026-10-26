@@ -400,3 +400,65 @@ def test_non_persistent_connection_is_not_reopened_when_idle(remote_module, monk
 
     assert device_class.instance.status_calls == 2
     assert device_class.instance.closed is False
+
+
+def test_persistent_connection_is_renewed_by_age_while_polled(remote_module, monkeypatch):
+    """Frequent polls keep it from idling, but the bridge drops old sockets anyway."""
+
+    now = [1000.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
+    remote, device_class = _make_persistent_remote(remote_module, [{"dps": {}}] * 3)
+
+    for _ in range(2):
+        remote._update_availibility_locked()
+        now[0] += 15
+    assert len(device_class.instances) == 1
+
+    remote._update_availibility_locked()
+    assert len(device_class.instances) == 2
+    assert device_class.instances[0].closed is True
+
+
+def test_command_reuses_connection_renewed_by_poll(remote_module, monkeypatch):
+    """A send shortly after a poll must not pay for a reconnect."""
+
+    now = [1000.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
+    remote, device_class = _make_persistent_remote(remote_module, [{"dps": {}}])
+    sent = []
+    device_class.send_button = lambda self, code: sent.append(code)
+
+    remote._update_availibility_locked()
+    now[0] += 14
+    remote._send_button("AAAA")
+
+    assert sent == ["AAAA"]
+    assert len(device_class.instances) == 1
+    assert remote._last_send == now[0]
+
+
+class _ExecutorHass:
+    async def async_add_executor_job(self, func, *args):
+        return func(*args)
+
+
+def test_refresh_right_after_command_is_skipped(remote_module, monkeypatch):
+    """HA's post-service refresh must not delay the caller after a send."""
+
+    import asyncio
+
+    now = [1000.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
+    remote, device_class = _make_persistent_remote(remote_module, [{"dps": {}}] * 2)
+    remote.hass = _ExecutorHass()
+    remote._storage = object()
+    device_class.send_button = lambda self, code: None
+
+    asyncio.run(remote.async_update())
+    remote._send_button("AAAA")
+    asyncio.run(remote.async_update())
+    assert device_class.instances[0].status_calls == 1
+
+    now[0] += remote._SKIP_UPDATE_AFTER_SEND + 1
+    asyncio.run(remote.async_update())
+    assert device_class.instances[0].status_calls == 2

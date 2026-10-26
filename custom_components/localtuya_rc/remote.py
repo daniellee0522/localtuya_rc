@@ -8,6 +8,7 @@ import homeassistant.helpers.config_validation as cv
 from tinytuya import Contrib, ERR_JSON, ERR_PAYLOAD, ERR_TIMEOUT
 from tinytuya.Contrib import RFRemoteControlDevice
 import threading
+from datetime import timedelta
 
 from .const import (
     DOMAIN,
@@ -68,6 +69,11 @@ _LOGGER = logging.getLogger(__name__)
 # lock protects TinyTuya I/O.
 PARALLEL_UPDATES = 1
 
+# Poll often enough that the persistent connection is refreshed in the
+# background before it goes stale, so sending a command never has to wait
+# for a reconnect (see TuyaRC._PERSISTENT_MAX_AGE).
+SCAN_INTERVAL = timedelta(seconds=15)
+
 
 async def async_setup_entry(hass, entry, async_add_entities, discovery_info=None):
     """Set up the Tuya IR Remote Control entry."""
@@ -111,11 +117,22 @@ class TuyaRC(RemoteEntity):
     _CONNECTION_RETRY_DELAY = 0.5
     _CONNECTION_RETRY_LIMIT = 2
 
-    # Tuya IR bridges silently close a persistent socket after a short idle
-    # period. tinytuya keeps reading the dead socket and reports ERR_PAYLOAD
-    # (904) for status(), while nowait sends on it can be lost without any
-    # error. Reopen the connection once it has been idle longer than this.
+    # Tuya IR bridges silently close a persistent socket some time after it
+    # was opened (reuse at 30s works, at 60s it is dead). tinytuya keeps
+    # reading the dead socket and reports ERR_PAYLOAD (904) for status(),
+    # while nowait sends on it can be lost without any error. Reopen the
+    # connection once it is older or has been idle longer than these.
     _PERSISTENT_IDLE_RECONNECT = 20
+    _PERSISTENT_MAX_AGE = 30
+    # Polls run in the background, so they renew the connection a bit earlier
+    # than commands would, keeping the reconnect cost off the command path.
+    _PERSISTENT_REFRESH_AGE = 25
+
+    # Home Assistant refreshes a polling entity right after each service call
+    # and makes the caller wait for it. A command that just went out proves
+    # the device is reachable, and the bridge is often still busy emitting IR
+    # and slow to answer, so skip that refresh for this long after a send.
+    _SKIP_UPDATE_AFTER_SEND = 5
 
     # Standard Tuya DPs reported by IR hubs that bundle a temperature/humidity
     # sensor (Tuya category "wnykq"), independent of control_type. Not every
@@ -143,20 +160,24 @@ class TuyaRC(RemoteEntity):
         self._device = None
         self._device_RF = None
         self._last_io = 0.0
+        self._connected_at = 0.0
+        self._last_send = 0.0
         self._lock = threading.Lock()
 
-    def _drop_idle_connection(self):
+    def _drop_stale_connection(self, max_age):
         if not self._persistent_connection or not (self._device or self._device_RF):
             return
-        if time.monotonic() - self._last_io > self._PERSISTENT_IDLE_RECONNECT:
-            _LOGGER.debug("Persistent connection to %s has been idle, reconnecting", self._dev_id)
+        now = time.monotonic()
+        if now - self._last_io > self._PERSISTENT_IDLE_RECONNECT or now - self._connected_at > max_age:
+            _LOGGER.debug("Persistent connection to %s is stale, reconnecting", self._dev_id)
             self._deinit()
 
-    def _init(self):
-        self._drop_idle_connection()
+    def _init(self, max_age=_PERSISTENT_MAX_AGE):
+        self._drop_stale_connection(max_age)
         self._last_io = time.monotonic()
         if self._device:
             return
+        self._connected_at = self._last_io
         _LOGGER.debug("Initializing device %s (address: %s, protocol_version: %s, persistent_connection: %s, control_type: %s)...", self._dev_id, self._address, self._protocol_version, self._persistent_connection, self._control_type)
         # Passing a non-zero control_type tells tinytuya to skip the network-heavy
         # detect_control_type() call that would otherwise run inside __init__ and
@@ -177,10 +198,12 @@ class TuyaRC(RemoteEntity):
     def _init_rf(self):
         # RF device is created on demand (lazy) so that _update_availibility()
         # does not pay for a second blocking constructor on every poll.
-        self._drop_idle_connection()
+        self._drop_stale_connection(self._PERSISTENT_MAX_AGE)
         self._last_io = time.monotonic()
         if self._device_RF:
             return
+        if not self._device:
+            self._connected_at = self._last_io
         _LOGGER.debug("Initializing RF device %s...", self._dev_id)
         self._device_RF = RFRemoteControlDevice.RFRemoteControlDevice(
             dev_id=self._dev_id,
@@ -376,7 +399,9 @@ class TuyaRC(RemoteEntity):
                 if type(pulses) == str:
                     _LOGGER.debug("Sending command as base64: '%s'", pulses)
                     try:
-                        return self._device.send_button(pulses)
+                        result = self._device.send_button(pulses)
+                        self._last_send = time.monotonic()
+                        return result
                     except Exception as e:
                         _LOGGER.error("Failed to send command as base64, exception %s: %s", type(e), e, exc_info=True)
                         raise HomeAssistantError("tinytuya library internal error, please check the logs.")
@@ -385,7 +410,9 @@ class TuyaRC(RemoteEntity):
                     b64 = Contrib.IRRemoteControlDevice.pulses_to_base64(pulses)
                     _LOGGER.debug("Converted to base64: '%s'", b64)
                     try:
-                        return self._device.send_button(b64)
+                        result = self._device.send_button(b64)
+                        self._last_send = time.monotonic()
+                        return result
                     except Exception as e:
                         _LOGGER.error("Failed to send command as pulses, exception %s: %s", type(e), e, exc_info=True)
                         raise HomeAssistantError("tinytuya library internal error, please check the logs.")
@@ -417,7 +444,9 @@ class TuyaRC(RemoteEntity):
                 self._init_rf()
                 try:
                     _LOGGER.debug("Sending command as base64: '%s'", base64)
-                    return self._device_RF.rf_send_button(base64)
+                    result = self._device_RF.rf_send_button(base64)
+                    self._last_send = time.monotonic()
+                    return result
                 except Exception as e:
                     _LOGGER.error("Failed to send RF button, exception %s: %s", type(e), e, exc_info=True)
                     raise HomeAssistantError("tinytuya library internal rf error, please check the logs.")
@@ -454,7 +483,7 @@ class TuyaRC(RemoteEntity):
     def _update_availibility_locked(self):
         _LOGGER.debug("Updating device %s availibility...", self._dev_id)
         try:
-            self._init()
+            self._init(max_age=self._PERSISTENT_REFRESH_AGE)
             status = self._device.status()
             # Safety net for a persistent socket the bridge closed before the
             # idle timeout: retry once on a fresh connection.
@@ -517,8 +546,14 @@ class TuyaRC(RemoteEntity):
         if self._lock.locked():
             _LOGGER.debug("Skipping availability update for busy device %s", self._dev_id)
             return
+        if self._available and time.monotonic() - self._last_send < self._SKIP_UPDATE_AFTER_SEND:
+            _LOGGER.debug("Skipping availability update for %s right after a command", self._dev_id)
+            return
         await self.hass.async_add_executor_job(self._update_availibility)
-        await self._async_load_storage_files()
+        # Commands reload the shared code storage themselves; polling only
+        # needs it once for the learned_commands attribute.
+        if not self._storage:
+            await self._async_load_storage_files()
 
     async def async_send_ir_pulses(self, pulses):
         """Send raw IR pulses (unsigned mark/space durations in µs, tinytuya format)
