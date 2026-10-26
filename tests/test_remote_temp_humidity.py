@@ -92,7 +92,7 @@ def remote_module(monkeypatch):
 
     contrib = types.SimpleNamespace(IRRemoteControlDevice=object)
     tinytuya = _install_module(
-        monkeypatch, "tinytuya", Contrib=contrib, ERR_JSON=900, ERR_TIMEOUT=902
+        monkeypatch, "tinytuya", Contrib=contrib, ERR_JSON=900, ERR_PAYLOAD=904, ERR_TIMEOUT=902
     )
     tinytuya.__path__ = []
     _install_module(

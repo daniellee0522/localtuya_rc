@@ -2,9 +2,10 @@
 import logging
 import asyncio
 import struct
+import time
 import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
-from tinytuya import Contrib, ERR_JSON, ERR_TIMEOUT
+from tinytuya import Contrib, ERR_JSON, ERR_PAYLOAD, ERR_TIMEOUT
 from tinytuya.Contrib import RFRemoteControlDevice
 import threading
 
@@ -110,6 +111,12 @@ class TuyaRC(RemoteEntity):
     _CONNECTION_RETRY_DELAY = 0.5
     _CONNECTION_RETRY_LIMIT = 2
 
+    # Tuya IR bridges silently close a persistent socket after a short idle
+    # period. tinytuya keeps reading the dead socket and reports ERR_PAYLOAD
+    # (904) for status(), while nowait sends on it can be lost without any
+    # error. Reopen the connection once it has been idle longer than this.
+    _PERSISTENT_IDLE_RECONNECT = 20
+
     # Standard Tuya DPs reported by IR hubs that bundle a temperature/humidity
     # sensor (Tuya category "wnykq"), independent of control_type. Not every
     # hub has this hardware, so these keys are simply absent from status()'s
@@ -135,9 +142,19 @@ class TuyaRC(RemoteEntity):
 
         self._device = None
         self._device_RF = None
+        self._last_io = 0.0
         self._lock = threading.Lock()
 
+    def _drop_idle_connection(self):
+        if not self._persistent_connection or not (self._device or self._device_RF):
+            return
+        if time.monotonic() - self._last_io > self._PERSISTENT_IDLE_RECONNECT:
+            _LOGGER.debug("Persistent connection to %s has been idle, reconnecting", self._dev_id)
+            self._deinit()
+
     def _init(self):
+        self._drop_idle_connection()
+        self._last_io = time.monotonic()
         if self._device:
             return
         _LOGGER.debug("Initializing device %s (address: %s, protocol_version: %s, persistent_connection: %s, control_type: %s)...", self._dev_id, self._address, self._protocol_version, self._persistent_connection, self._control_type)
@@ -160,6 +177,8 @@ class TuyaRC(RemoteEntity):
     def _init_rf(self):
         # RF device is created on demand (lazy) so that _update_availibility()
         # does not pay for a second blocking constructor on every poll.
+        self._drop_idle_connection()
+        self._last_io = time.monotonic()
         if self._device_RF:
             return
         _LOGGER.debug("Initializing RF device %s...", self._dev_id)
@@ -419,6 +438,10 @@ class TuyaRC(RemoteEntity):
         """Turn the device off."""
         raise HomeAssistantError("Turning off is not supported for this device.")
 
+    @staticmethod
+    def _is_status_error(status, *codes):
+        return isinstance(status, dict) and str(status.get("Err", "")).strip() in {str(c) for c in codes}
+
     def _update_availibility(self):
         if not self._lock.acquire(blocking=False):
             _LOGGER.debug("Skipping availability update for busy device %s", self._dev_id)
@@ -433,6 +456,13 @@ class TuyaRC(RemoteEntity):
         try:
             self._init()
             status = self._device.status()
+            # Safety net for a persistent socket the bridge closed before the
+            # idle timeout: retry once on a fresh connection.
+            if self._persistent_connection and self._is_status_error(status, ERR_PAYLOAD):
+                _LOGGER.debug("Reconnecting to %s after a stale persistent connection", self._dev_id)
+                self._deinit()
+                self._init()
+                status = self._device.status()
             # tinytuya documents that an IR bridge can accept a connection after
             # reboot but ignore status() until it receives a command. A power-
             # cycled bridge answers status() with ERR_JSON 900 ("json obj data
@@ -441,11 +471,7 @@ class TuyaRC(RemoteEntity):
             # wake probe for the detected control type; retry status() once after.
             if self._device.control_type and (
                 status is None
-                or (
-                    isinstance(status, dict)
-                    and str(status.get("Err", "")).strip()
-                    in (str(ERR_JSON), str(ERR_TIMEOUT))
-                )
+                or self._is_status_error(status, ERR_JSON, ERR_TIMEOUT)
             ):
                 _LOGGER.debug(
                     "Waking IR device %s after an unresponsive status request",

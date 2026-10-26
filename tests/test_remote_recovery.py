@@ -92,7 +92,7 @@ def remote_module(monkeypatch):
 
     contrib = types.SimpleNamespace(IRRemoteControlDevice=object)
     tinytuya = _install_module(
-        monkeypatch, "tinytuya", Contrib=contrib, ERR_JSON=900, ERR_TIMEOUT=902
+        monkeypatch, "tinytuya", Contrib=contrib, ERR_JSON=900, ERR_PAYLOAD=904, ERR_TIMEOUT=902
     )
     tinytuya.__path__ = []
     _install_module(
@@ -299,3 +299,104 @@ def test_requires_tinytuya_timeout_error_support():
     version = tuple(int(part) for part in requirement.split(">=", 1)[1].split("."))
 
     assert version >= (1, 20, 0)
+
+
+def _make_persistent_remote(remote_module, statuses):
+    """Like _make_remote(), but persistent and sharing statuses across reconnects."""
+
+    statuses = iter(statuses)
+
+    class Device:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.control_type = 1
+            self.persist = kwargs.get("persist")
+            self.status_calls = 0
+            self.closed = False
+            Device.instances.append(self)
+
+        def status(self):
+            self.status_calls += 1
+            return next(statuses)
+
+        def study_end(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    remote_module.Contrib.IRRemoteControlDevice = Device
+    remote = remote_module.TuyaRC(
+        "Test",
+        "device-id",
+        "127.0.0.1",
+        "local-key",
+        "3.3",
+        persistent_connection=True,
+        control_type=1,
+    )
+    return remote, Device
+
+
+def test_stale_persistent_socket_reconnects_once(remote_module):
+    """ERR_PAYLOAD on a persistent socket is retried on a fresh connection."""
+
+    remote, device_class = _make_persistent_remote(
+        remote_module, [_status_error("904"), {"dps": {}}]
+    )
+    remote._update_availibility_locked()
+
+    assert remote.available is True
+    assert len(device_class.instances) == 2
+    assert device_class.instances[0].closed is True
+    assert device_class.instances[1].closed is False
+
+
+def test_stale_persistent_socket_stays_unavailable_after_retry(remote_module):
+    """A second ERR_PAYLOAD on the fresh connection still marks it unavailable."""
+
+    remote, device_class = _make_persistent_remote(
+        remote_module, [_status_error("904"), _status_error("904")]
+    )
+    remote._update_availibility_locked()
+
+    assert remote.available is False
+    assert len(device_class.instances) == 2
+    assert all(device.closed for device in device_class.instances)
+
+
+def test_idle_persistent_connection_is_reopened(remote_module, monkeypatch):
+    """A persistent socket idle past the threshold is replaced before use."""
+
+    now = [1000.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
+    remote, device_class = _make_persistent_remote(
+        remote_module, [{"dps": {}}, {"dps": {}}, {"dps": {}}]
+    )
+
+    remote._update_availibility_locked()
+    now[0] += remote._PERSISTENT_IDLE_RECONNECT - 1
+    remote._update_availibility_locked()
+    assert len(device_class.instances) == 1
+
+    now[0] += remote._PERSISTENT_IDLE_RECONNECT + 1
+    remote._update_availibility_locked()
+    assert len(device_class.instances) == 2
+    assert device_class.instances[0].closed is True
+    assert remote.available is True
+
+
+def test_non_persistent_connection_is_not_reopened_when_idle(remote_module, monkeypatch):
+    """Without persistence tinytuya opens a socket per request already."""
+
+    now = [1000.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
+    remote, device_class = _make_remote(remote_module, [{"dps": {}}, {"dps": {}}])
+
+    remote._update_availibility_locked()
+    now[0] += 3600
+    remote._update_availibility_locked()
+
+    assert device_class.instance.status_calls == 2
+    assert device_class.instance.closed is False
