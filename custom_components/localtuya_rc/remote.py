@@ -1,6 +1,7 @@
 """Support for Tuya IR Remote Control."""
 import logging
 import asyncio
+import select
 import struct
 import time
 import voluptuous as vol
@@ -166,6 +167,31 @@ class TuyaRC(RemoteEntity):
         if time.monotonic() - self._last_keepalive > self._KEEPALIVE_TIMEOUT:
             _LOGGER.debug("Persistent connection to %s missed its heartbeats, reconnecting", self._dev_id)
             self._deinit()
+            return
+        for device in (self._device, self._device_RF):
+            if device and not self._drain_socket(device):
+                _LOGGER.debug("Persistent connection to %s was closed by the device, reconnecting", self._dev_id)
+                self._deinit()
+                return
+
+    @staticmethod
+    def _drain_socket(device):
+        """Discard unread messages on a persistent socket; False if it is closed.
+
+        The bridge acknowledges every command and heartbeat, but nowait sends
+        never read those replies. On a long-lived socket they pile up, and
+        status() gives up after reading a few of them instead of its answer.
+        """
+        sock = getattr(device, "socket", None)
+        if sock is None:
+            return True
+        try:
+            while select.select([sock], [], [], 0)[0]:
+                if not sock.recv(4096):
+                    return False
+        except OSError:
+            return False
+        return True
 
     def _keepalive(self):
         if not self._persistent_connection:

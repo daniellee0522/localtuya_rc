@@ -315,6 +315,7 @@ def _make_persistent_remote(remote_module, statuses):
             self.status_calls = 0
             self.heartbeats = 0
             self.closed = False
+            self.socket = None
             Device.instances.append(self)
 
         def status(self):
@@ -471,3 +472,50 @@ def test_continuous_commands_do_not_starve_heartbeats(remote_module, monkeypatch
 
     assert device_class.instances[0].heartbeats == 2
     assert len(device_class.instances) == 1
+
+
+
+def test_unread_acknowledgements_are_drained_before_use(remote_module):
+    """Acks for nowait sends must not be mistaken for the status answer."""
+
+    import socket
+
+    remote, device_class = _make_persistent_remote(remote_module, [{"dps": {}}] * 2)
+    remote._update_availibility_locked()
+    ours, bridge = socket.socketpair()
+    try:
+        device_class.instances[0].socket = ours
+        bridge.sendall(b"ack" * 5000)
+
+        remote._update_availibility_locked()
+
+        assert len(device_class.instances) == 1
+        ours.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            ours.recv(1)
+    finally:
+        ours.close()
+        bridge.close()
+
+
+def test_socket_closed_by_bridge_is_reopened_before_send(remote_module):
+    """A command must not be written into a socket the bridge has closed."""
+
+    import socket
+
+    remote, device_class = _make_persistent_remote(remote_module, [{"dps": {}}])
+    sent = []
+    device_class.send_button = lambda self, code: sent.append(self)
+    remote._update_availibility_locked()
+    ours, bridge = socket.socketpair()
+    try:
+        device_class.instances[0].socket = ours
+        bridge.close()
+
+        remote._send_button("AAAA")
+
+        assert len(device_class.instances) == 2
+        assert device_class.instances[0].closed is True
+        assert sent == [device_class.instances[1]]
+    finally:
+        ours.close()
