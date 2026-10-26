@@ -313,6 +313,7 @@ def _make_persistent_remote(remote_module, statuses):
             self.control_type = 1
             self.persist = kwargs.get("persist")
             self.status_calls = 0
+            self.heartbeats = 0
             self.closed = False
             Device.instances.append(self)
 
@@ -322,6 +323,10 @@ def _make_persistent_remote(remote_module, statuses):
 
         def study_end(self):
             pass
+
+        def heartbeat(self, nowait=True):
+            assert nowait
+            self.heartbeats += 1
 
         def close(self):
             self.closed = True
@@ -366,33 +371,49 @@ def test_stale_persistent_socket_stays_unavailable_after_retry(remote_module):
     assert all(device.closed for device in device_class.instances)
 
 
-def test_idle_persistent_connection_is_reopened(remote_module, monkeypatch):
-    """A persistent socket idle past the threshold is replaced before use."""
+
+def test_polled_persistent_connection_is_kept_alive(remote_module, monkeypatch):
+    """Heartbeats on every poll keep one connection open indefinitely."""
 
     now = [1000.0]
     monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
-    remote, device_class = _make_persistent_remote(
-        remote_module, [{"dps": {}}, {"dps": {}}, {"dps": {}}]
-    )
+    remote, device_class = _make_persistent_remote(remote_module, [{"dps": {}}] * 20)
 
-    remote._update_availibility_locked()
-    now[0] += remote._PERSISTENT_IDLE_RECONNECT - 1
-    remote._update_availibility_locked()
+    for _ in range(20):
+        remote._update_availibility_locked()
+        now[0] += 15
+
     assert len(device_class.instances) == 1
-
-    now[0] += remote._PERSISTENT_IDLE_RECONNECT + 1
-    remote._update_availibility_locked()
-    assert len(device_class.instances) == 2
-    assert device_class.instances[0].closed is True
+    assert device_class.instances[0].heartbeats == 20
     assert remote.available is True
 
 
-def test_non_persistent_connection_is_not_reopened_when_idle(remote_module, monkeypatch):
+def test_connection_without_heartbeats_is_reopened(remote_module, monkeypatch):
+    """Once heartbeats lapse the bridge may have dropped the socket."""
+
+    now = [1000.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
+    remote, device_class = _make_persistent_remote(remote_module, [{"dps": {}}])
+    device_class.send_button = lambda self, code: None
+
+    remote._update_availibility_locked()
+    now[0] += remote._KEEPALIVE_TIMEOUT - 1
+    remote._send_button("AAAA")
+    assert len(device_class.instances) == 1
+
+    now[0] += 2
+    remote._send_button("AAAA")
+    assert len(device_class.instances) == 2
+    assert device_class.instances[0].closed is True
+
+
+def test_non_persistent_connection_gets_no_heartbeats(remote_module, monkeypatch):
     """Without persistence tinytuya opens a socket per request already."""
 
     now = [1000.0]
     monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
     remote, device_class = _make_remote(remote_module, [{"dps": {}}, {"dps": {}}])
+    device_class.heartbeat = lambda self, nowait=True: pytest.fail("heartbeat sent")
 
     remote._update_availibility_locked()
     now[0] += 3600
@@ -402,50 +423,19 @@ def test_non_persistent_connection_is_not_reopened_when_idle(remote_module, monk
     assert device_class.instance.closed is False
 
 
-def test_persistent_connection_is_renewed_by_age_while_polled(remote_module, monkeypatch):
-    """Frequent polls keep it from idling, but the bridge drops old sockets anyway."""
-
-    now = [1000.0]
-    monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
-    remote, device_class = _make_persistent_remote(remote_module, [{"dps": {}}] * 3)
-
-    for _ in range(2):
-        remote._update_availibility_locked()
-        now[0] += 15
-    assert len(device_class.instances) == 1
-
-    remote._update_availibility_locked()
-    assert len(device_class.instances) == 2
-    assert device_class.instances[0].closed is True
-
-
-def test_command_reuses_connection_renewed_by_poll(remote_module, monkeypatch):
-    """A send shortly after a poll must not pay for a reconnect."""
-
-    now = [1000.0]
-    monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
-    remote, device_class = _make_persistent_remote(remote_module, [{"dps": {}}])
-    sent = []
-    device_class.send_button = lambda self, code: sent.append(code)
-
-    remote._update_availibility_locked()
-    now[0] += 14
-    remote._send_button("AAAA")
-
-    assert sent == ["AAAA"]
-    assert len(device_class.instances) == 1
-    assert remote._last_send == now[0]
-
-
 class _ExecutorHass:
     async def async_add_executor_job(self, func, *args):
         return func(*args)
 
 
+def _run_update(remote):
+    import asyncio
+
+    asyncio.run(remote.async_update())
+
+
 def test_refresh_right_after_command_is_skipped(remote_module, monkeypatch):
     """HA's post-service refresh must not delay the caller after a send."""
-
-    import asyncio
 
     now = [1000.0]
     monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
@@ -454,11 +444,30 @@ def test_refresh_right_after_command_is_skipped(remote_module, monkeypatch):
     remote._storage = object()
     device_class.send_button = lambda self, code: None
 
-    asyncio.run(remote.async_update())
+    _run_update(remote)
     remote._send_button("AAAA")
-    asyncio.run(remote.async_update())
+    _run_update(remote)
     assert device_class.instances[0].status_calls == 1
 
     now[0] += remote._SKIP_UPDATE_AFTER_SEND + 1
-    asyncio.run(remote.async_update())
+    _run_update(remote)
     assert device_class.instances[0].status_calls == 2
+
+
+def test_continuous_commands_do_not_starve_heartbeats(remote_module, monkeypatch):
+    """A refresh right after a send still runs when a heartbeat is due."""
+
+    now = [1000.0]
+    monkeypatch.setattr(remote_module.time, "monotonic", lambda: now[0])
+    remote, device_class = _make_persistent_remote(remote_module, [{"dps": {}}] * 2)
+    remote.hass = _ExecutorHass()
+    remote._storage = object()
+    device_class.send_button = lambda self, code: None
+
+    _run_update(remote)
+    now[0] += remote_module.SCAN_INTERVAL.total_seconds()
+    remote._send_button("AAAA")
+    _run_update(remote)
+
+    assert device_class.instances[0].heartbeats == 2
+    assert len(device_class.instances) == 1

@@ -69,9 +69,8 @@ _LOGGER = logging.getLogger(__name__)
 # lock protects TinyTuya I/O.
 PARALLEL_UPDATES = 1
 
-# Poll often enough that the persistent connection is refreshed in the
-# background before it goes stale, so sending a command never has to wait
-# for a reconnect (see TuyaRC._PERSISTENT_MAX_AGE).
+# Each poll also sends the heartbeat that keeps a persistent connection
+# alive, so poll well within TuyaRC._KEEPALIVE_TIMEOUT.
 SCAN_INTERVAL = timedelta(seconds=15)
 
 
@@ -117,16 +116,14 @@ class TuyaRC(RemoteEntity):
     _CONNECTION_RETRY_DELAY = 0.5
     _CONNECTION_RETRY_LIMIT = 2
 
-    # Tuya IR bridges silently close a persistent socket some time after it
-    # was opened (reuse at 30s works, at 60s it is dead). tinytuya keeps
-    # reading the dead socket and reports ERR_PAYLOAD (904) for status(),
-    # while nowait sends on it can be lost without any error. Reopen the
-    # connection once it is older or has been idle longer than these.
-    _PERSISTENT_IDLE_RECONNECT = 20
-    _PERSISTENT_MAX_AGE = 30
-    # Polls run in the background, so they renew the connection a bit earlier
-    # than commands would, keeping the reconnect cost off the command path.
-    _PERSISTENT_REFRESH_AGE = 25
+    # Tuya IR bridges silently close a persistent socket that gets no
+    # heartbeats (status queries do not count): it still works after 30s,
+    # but is dead after 60s. tinytuya then keeps reading the dead socket and
+    # reports ERR_PAYLOAD (904) for status(), while nowait sends on it can be
+    # lost without any error. Polls send heartbeats, so with them the
+    # connection lives indefinitely; reopen it only if they lapsed this long.
+    # Reconnecting is worth avoiding: the bridge sometimes takes ~1s to accept.
+    _KEEPALIVE_TIMEOUT = 30
 
     # Home Assistant refreshes a polling entity right after each service call
     # and makes the caller wait for it. A command that just went out proves
@@ -159,25 +156,31 @@ class TuyaRC(RemoteEntity):
 
         self._device = None
         self._device_RF = None
-        self._last_io = 0.0
-        self._connected_at = 0.0
+        self._last_keepalive = 0.0
         self._last_send = 0.0
         self._lock = threading.Lock()
 
-    def _drop_stale_connection(self, max_age):
+    def _drop_stale_connection(self):
         if not self._persistent_connection or not (self._device or self._device_RF):
             return
-        now = time.monotonic()
-        if now - self._last_io > self._PERSISTENT_IDLE_RECONNECT or now - self._connected_at > max_age:
-            _LOGGER.debug("Persistent connection to %s is stale, reconnecting", self._dev_id)
+        if time.monotonic() - self._last_keepalive > self._KEEPALIVE_TIMEOUT:
+            _LOGGER.debug("Persistent connection to %s missed its heartbeats, reconnecting", self._dev_id)
             self._deinit()
 
-    def _init(self, max_age=_PERSISTENT_MAX_AGE):
-        self._drop_stale_connection(max_age)
-        self._last_io = time.monotonic()
+    def _keepalive(self):
+        if not self._persistent_connection:
+            return
+        for device in (self._device, self._device_RF):
+            if device:
+                device.heartbeat(nowait=True)
+        self._last_keepalive = time.monotonic()
+
+    def _init(self):
+        self._drop_stale_connection()
         if self._device:
             return
-        self._connected_at = self._last_io
+        if not self._device_RF:
+            self._last_keepalive = time.monotonic()
         _LOGGER.debug("Initializing device %s (address: %s, protocol_version: %s, persistent_connection: %s, control_type: %s)...", self._dev_id, self._address, self._protocol_version, self._persistent_connection, self._control_type)
         # Passing a non-zero control_type tells tinytuya to skip the network-heavy
         # detect_control_type() call that would otherwise run inside __init__ and
@@ -198,12 +201,11 @@ class TuyaRC(RemoteEntity):
     def _init_rf(self):
         # RF device is created on demand (lazy) so that _update_availibility()
         # does not pay for a second blocking constructor on every poll.
-        self._drop_stale_connection(self._PERSISTENT_MAX_AGE)
-        self._last_io = time.monotonic()
+        self._drop_stale_connection()
         if self._device_RF:
             return
         if not self._device:
-            self._connected_at = self._last_io
+            self._last_keepalive = time.monotonic()
         _LOGGER.debug("Initializing RF device %s...", self._dev_id)
         self._device_RF = RFRemoteControlDevice.RFRemoteControlDevice(
             dev_id=self._dev_id,
@@ -483,10 +485,11 @@ class TuyaRC(RemoteEntity):
     def _update_availibility_locked(self):
         _LOGGER.debug("Updating device %s availibility...", self._dev_id)
         try:
-            self._init(max_age=self._PERSISTENT_REFRESH_AGE)
+            self._init()
+            self._keepalive()
             status = self._device.status()
-            # Safety net for a persistent socket the bridge closed before the
-            # idle timeout: retry once on a fresh connection.
+            # Safety net for a persistent socket the bridge closed anyway:
+            # retry once on a fresh connection.
             if self._persistent_connection and self._is_status_error(status, ERR_PAYLOAD):
                 _LOGGER.debug("Reconnecting to %s after a stale persistent connection", self._dev_id)
                 self._deinit()
@@ -546,7 +549,12 @@ class TuyaRC(RemoteEntity):
         if self._lock.locked():
             _LOGGER.debug("Skipping availability update for busy device %s", self._dev_id)
             return
-        if self._available and time.monotonic() - self._last_send < self._SKIP_UPDATE_AFTER_SEND:
+        now = time.monotonic()
+        if (
+            self._available
+            and now - self._last_send < self._SKIP_UPDATE_AFTER_SEND
+            and now - self._last_keepalive < SCAN_INTERVAL.total_seconds()
+        ):
             _LOGGER.debug("Skipping availability update for %s right after a command", self._dev_id)
             return
         await self.hass.async_add_executor_job(self._update_availibility)
